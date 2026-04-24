@@ -447,6 +447,37 @@ final class PenteGameViewModel: ObservableObject {
             return (center, center)
         }
 
+        let emergencyLegal = allLegalMoves(
+            board: board,
+            player: player,
+            historyCount: historyCount,
+            tournamentOpening: tournamentOpening
+        )
+        guard !emergencyLegal.isEmpty else { return nil }
+
+        if let winningMove = bestEmergencyMove(
+            from: emergencyLegal,
+            for: player,
+            board: board,
+            capturesBlack: capturesBlack,
+            capturesWhite: capturesWhite,
+            strength: strength
+        ) {
+            return winningMove
+        }
+
+        let opponent = player.opposite
+        if let blockingMove = bestEmergencyMove(
+            from: emergencyLegal,
+            for: opponent,
+            board: board,
+            capturesBlack: capturesBlack,
+            capturesWhite: capturesWhite,
+            strength: strength
+        ) {
+            return blockingMove
+        }
+
         let legal = candidateMoves(
             board: board,
             player: player,
@@ -485,8 +516,9 @@ final class PenteGameViewModel: ObservableObject {
         let size = board.count
         let center = size / 2
         if tournamentOpening, historyCount == 2, player == .black {
-            return [(center - 3, center), (center + 3, center), (center, center - 3), (center, center + 3)]
-                .filter { isOnBoard($0.0, $0.1, size: size) && board[$0.0][$0.1] == .empty }
+            return openingRestrictionMoves(board: board)
+                .prefix(limit)
+                .map { $0 }
         }
 
         var candidates = Set<[Int]>()
@@ -517,6 +549,76 @@ final class PenteGameViewModel: ObservableObject {
             .map { $0 }
     }
 
+    private static func allLegalMoves(
+        board: [[Stone]],
+        player: Stone,
+        historyCount: Int,
+        tournamentOpening: Bool
+    ) -> [(Int, Int)] {
+        let size = board.count
+        if tournamentOpening, historyCount == 2, player == .black {
+            return openingRestrictionMoves(board: board)
+        }
+
+        var moves: [(Int, Int)] = []
+        moves.reserveCapacity(size * size)
+        for row in 0..<size {
+            for col in 0..<size where board[row][col] == .empty {
+                moves.append((row, col))
+            }
+        }
+        return moves
+    }
+
+    private static func openingRestrictionMoves(board: [[Stone]]) -> [(Int, Int)] {
+        let size = board.count
+        let center = size / 2
+        var moves: [(Int, Int)] = []
+        for row in 0..<size {
+            for col in 0..<size where board[row][col] == .empty {
+                if abs(row - center) >= 3 || abs(col - center) >= 3 {
+                    moves.append((row, col))
+                }
+            }
+        }
+        return moves.sorted {
+            let left = abs($0.0 - center) + abs($0.1 - center)
+            let right = abs($1.0 - center) + abs($1.1 - center)
+            return left < right
+        }
+    }
+
+    private static func bestEmergencyMove(
+        from moves: [(Int, Int)],
+        for player: Stone,
+        board: [[Stone]],
+        capturesBlack: Int,
+        capturesWhite: Int,
+        strength: AIStrength
+    ) -> (Int, Int)? {
+        let winningMoves = moves.filter {
+            moveWinsImmediately($0, for: player, board: board, capturesBlack: capturesBlack, capturesWhite: capturesWhite)
+        }
+        guard !winningMoves.isEmpty else { return nil }
+        return winningMoves.max {
+            evaluate(
+                move: $0,
+                player: player,
+                board: board,
+                capturesBlack: capturesBlack,
+                capturesWhite: capturesWhite,
+                strength: strength
+            ) < evaluate(
+                move: $1,
+                player: player,
+                board: board,
+                capturesBlack: capturesBlack,
+                capturesWhite: capturesWhite,
+                strength: strength
+            )
+        }
+    }
+
     private static func evaluate(
         move: (Int, Int),
         player: Stone,
@@ -528,7 +630,9 @@ final class PenteGameViewModel: ObservableObject {
         var trial = board
         trial[move.0][move.1] = player
         let captured = simulatedCaptures(row: move.0, col: move.1, player: player, board: &trial)
-        let myCaptures = (player == .black ? capturesBlack : capturesWhite) + captured / 2
+        let myCapturesBefore = player == .black ? capturesBlack : capturesWhite
+        let opponentCaptures = player == .black ? capturesWhite : capturesBlack
+        let myCaptures = myCapturesBefore + captured / 2
         if myCaptures >= 5 || lineLength(row: move.0, col: move.1, player: player, board: trial) >= 5 {
             return 1_000_000
         }
@@ -538,12 +642,25 @@ final class PenteGameViewModel: ObservableObject {
         score += captured * 4_000
         score += patternScore(row: move.0, col: move.1, player: player, board: trial)
         score += centerScore(row: move.0, col: move.1, size: board.count)
+        score += boardPatternScore(board: trial, player: player)
+        score -= boardPatternScore(board: trial, player: opponent) * 2
 
         if strength != .fast {
-            score += defensiveScore(after: trial, opponent: opponent)
+            score -= opponentThreatScore(
+                after: trial,
+                opponent: opponent,
+                capturesBlack: player == .black ? myCaptures : opponentCaptures,
+                capturesWhite: player == .white ? myCaptures : opponentCaptures
+            )
         }
         if strength == .strong {
-            score -= opponentBestReplyThreat(after: trial, opponent: opponent) / 2
+            score += tacticalLookaheadScore(
+                after: trial,
+                player: player,
+                capturesBlack: player == .black ? myCaptures : opponentCaptures,
+                capturesWhite: player == .white ? myCaptures : opponentCaptures,
+                strength: strength
+            )
         }
         return score
     }
@@ -559,19 +676,133 @@ final class PenteGameViewModel: ObservableObject {
         }
     }
 
-    private static func defensiveScore(after board: [[Stone]], opponent: Stone) -> Int {
+    private static func opponentThreatScore(
+        after board: [[Stone]],
+        opponent: Stone,
+        capturesBlack: Int,
+        capturesWhite: Int
+    ) -> Int {
         var best = 0
         for row in 0..<board.count {
             for col in 0..<board.count where board[row][col] == .empty {
                 var trial = board
                 trial[row][col] = opponent
+                let captured = simulatedCaptures(row: row, col: col, player: opponent, board: &trial)
+                let capturePairs = (opponent == .black ? capturesBlack : capturesWhite) + captured / 2
                 let length = lineLength(row: row, col: col, player: opponent, board: trial)
-                if length >= 5 { best = max(best, 180_000) }
-                if length == 4 { best = max(best, 42_000) }
-                if length == 3 { best = max(best, 9_000) }
+                if capturePairs >= 5 || length >= 5 { best = max(best, 500_000) }
+                if length == 4 { best = max(best, 80_000 + openEndCount(row: row, col: col, player: opponent, board: trial) * 12_000) }
+                if length == 3 { best = max(best, 16_000 + openEndCount(row: row, col: col, player: opponent, board: trial) * 4_000) }
             }
         }
         return best
+    }
+
+    private static func tacticalLookaheadScore(
+        after board: [[Stone]],
+        player: Stone,
+        capturesBlack: Int,
+        capturesWhite: Int,
+        strength: AIStrength
+    ) -> Int {
+        let opponent = player.opposite
+        let opponentReplies = candidateMoves(
+            board: board,
+            player: opponent,
+            historyCount: 99,
+            tournamentOpening: false,
+            limit: 48
+        )
+        guard !opponentReplies.isEmpty else { return 0 }
+
+        var worstReply = Int.min
+        for reply in opponentReplies {
+            let replyScore = evaluateShallow(
+                move: reply,
+                player: opponent,
+                board: board,
+                capturesBlack: capturesBlack,
+                capturesWhite: capturesWhite
+            )
+            worstReply = max(worstReply, replyScore)
+        }
+
+        var bestFollowUp = 0
+        let myFollowUps = candidateMoves(
+            board: board,
+            player: player,
+            historyCount: 99,
+            tournamentOpening: false,
+            limit: strength == .strong ? 32 : 18
+        )
+        for followUp in myFollowUps {
+            bestFollowUp = max(bestFollowUp, evaluateShallow(
+                move: followUp,
+                player: player,
+                board: board,
+                capturesBlack: capturesBlack,
+                capturesWhite: capturesWhite
+            ))
+        }
+
+        return (bestFollowUp / 4) - worstReply
+    }
+
+    private static func evaluateShallow(
+        move: (Int, Int),
+        player: Stone,
+        board: [[Stone]],
+        capturesBlack: Int,
+        capturesWhite: Int
+    ) -> Int {
+        var trial = board
+        trial[move.0][move.1] = player
+        let captured = simulatedCaptures(row: move.0, col: move.1, player: player, board: &trial)
+        let capturePairs = (player == .black ? capturesBlack : capturesWhite) + captured / 2
+        if capturePairs >= 5 || lineLength(row: move.0, col: move.1, player: player, board: trial) >= 5 {
+            return 1_000_000
+        }
+        return captured * 5_000
+            + patternScore(row: move.0, col: move.1, player: player, board: trial)
+            + boardPatternScore(board: trial, player: player)
+    }
+
+    private static func boardPatternScore(board: [[Stone]], player: Stone) -> Int {
+        var score = 0
+        for row in 0..<board.count {
+            for col in 0..<board.count where board[row][col] == player {
+                let length = lineLength(row: row, col: col, player: player, board: board)
+                let openEnds = openEndCount(row: row, col: col, player: player, board: board)
+                switch length {
+                case 4...:
+                    score += 14_000 + openEnds * 4_000
+                case 3:
+                    score += 3_800 + openEnds * 1_200
+                case 2:
+                    score += 700 + openEnds * 250
+                default:
+                    score += openEnds * 35
+                }
+            }
+        }
+        return score
+    }
+
+    private static func moveWinsImmediately(
+        _ move: (Int, Int),
+        for player: Stone,
+        board: [[Stone]],
+        capturesBlack: Int,
+        capturesWhite: Int
+    ) -> Bool {
+        guard isOnBoard(move.0, move.1, size: board.count), board[move.0][move.1] == .empty else {
+            return false
+        }
+        var trial = board
+        trial[move.0][move.1] = player
+        let captured = simulatedCaptures(row: move.0, col: move.1, player: player, board: &trial)
+        let capturePairs = (player == .black ? capturesBlack : capturesWhite) + captured / 2
+        return capturePairs >= 5 || lineLength(row: move.0, col: move.1, player: player, board: trial) >= 5
     }
 
     private static func opponentBestReplyThreat(after board: [[Stone]], opponent: Stone) -> Int {
