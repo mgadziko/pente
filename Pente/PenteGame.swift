@@ -20,6 +20,14 @@ enum Stone: String, Codable {
         case .empty: return "Empty"
         }
     }
+
+    fileprivate var hashCode: UInt64 {
+        switch self {
+        case .empty: return 0
+        case .black: return 1
+        case .white: return 2
+        }
+    }
 }
 
 enum PlayerType: String, CaseIterable, Identifiable, Codable {
@@ -60,6 +68,23 @@ struct BoardPoint: Codable, Hashable {
     let col: Int
 }
 
+private struct LearningTraceEntry: Codable {
+    let boardHashHex: String
+    let stone: Stone
+    let moveIndex: Int
+    let wasAI: Bool
+}
+
+private struct LearnedMoveStats: Codable {
+    var plays: Int
+    var wins: Double
+}
+
+private struct StrategyLearningBook: Codable {
+    var version: Int = 1
+    var moveStats: [String: LearnedMoveStats] = [:]
+}
+
 private struct PenteSnapshot: Codable {
     var board: [[Stone]]
     var currentPlayer: Stone
@@ -75,6 +100,8 @@ private struct PenteSnapshot: Codable {
     var statusMessage: String
     var lastMoveRow: Int?
     var lastMoveCol: Int?
+    var learningTrace: [LearningTraceEntry]?
+    var aiPaused: Bool?
 }
 
 final class PenteGameViewModel: ObservableObject {
@@ -83,6 +110,10 @@ final class PenteGameViewModel: ObservableObject {
     private let directions = [(0, 1), (1, 0), (1, 1), (1, -1)]
     private var aiComputationToken = 0
     private var isRestoringFromLoad = false
+    private var learningBook = StrategyLearningBook()
+    private var learningTrace: [LearningTraceEntry] = []
+    private let learningLock = NSLock()
+    private let learningMaxEntries = 80_000
 
     @Published var board: [[Stone]]
     @Published var currentPlayer: Stone = .black
@@ -122,9 +153,11 @@ final class PenteGameViewModel: ObservableObject {
     @Published var lastMoveRow: Int?
     @Published var lastMoveCol: Int?
     @Published private(set) var isAIThinking = false
+    @Published private(set) var aiPaused = false
 
     init() {
         board = Array(repeating: Array(repeating: .empty, count: boardSize), count: boardSize)
+        loadLearningBook()
         if !loadGameFromDisk(manual: false) {
             newGame()
         }
@@ -137,6 +170,7 @@ final class PenteGameViewModel: ObservableObject {
         capturesByBlack = 0
         capturesByWhite = 0
         moveHistory = []
+        learningTrace = []
         gameOver = false
         winner = nil
         lastMoveRow = nil
@@ -145,6 +179,22 @@ final class PenteGameViewModel: ObservableObject {
         statusMessage = "Black to move"
         saveGameToDisk(manual: false)
         scheduleAIMoveIfNeeded()
+    }
+
+    func toggleAIPause() {
+        aiPaused.toggle()
+        aiComputationToken += 1
+        isAIThinking = false
+        if aiPaused {
+            if !gameOver, playerType(for: currentPlayer) == .ai {
+                statusMessage = "\(currentPlayer.name) AI paused"
+            }
+        } else if !gameOver, playerType(for: currentPlayer) == .ai {
+            scheduleAIMoveIfNeeded()
+        } else if !gameOver {
+            statusMessage = "\(currentPlayer.name) to move"
+        }
+        saveGameToDisk(manual: false)
     }
 
     func playHuman(row: Int, col: Int) {
@@ -186,7 +236,9 @@ final class PenteGameViewModel: ObservableObject {
             winner: winner,
             statusMessage: statusMessage,
             lastMoveRow: lastMoveRow,
-            lastMoveCol: lastMoveCol
+            lastMoveCol: lastMoveCol,
+            learningTrace: learningTrace,
+            aiPaused: aiPaused
         )
 
         do {
@@ -220,6 +272,8 @@ final class PenteGameViewModel: ObservableObject {
             statusMessage = manual ? "Game loaded" : snapshot.statusMessage
             lastMoveRow = snapshot.lastMoveRow
             lastMoveCol = snapshot.lastMoveCol
+            learningTrace = snapshot.learningTrace ?? []
+            aiPaused = snapshot.aiPaused ?? false
             isRestoringFromLoad = false
             if !manual {
                 scheduleAIMoveIfNeeded()
@@ -246,6 +300,12 @@ final class PenteGameViewModel: ObservableObject {
         }
 
         let player = currentPlayer
+        let boardHashBeforeMove = Self.boardHashHex(
+            for: board,
+            capturesBlack: capturesByBlack,
+            capturesWhite: capturesByWhite,
+            currentPlayer: player
+        )
         board[row][col] = player
         let captured = removeCapturedPairs(fromRow: row, col: col, player: player)
         if player == .black {
@@ -279,12 +339,26 @@ final class PenteGameViewModel: ObservableObject {
             captured: captured,
             result: result
         ))
+        learningTrace.append(LearningTraceEntry(
+            boardHashHex: boardHashBeforeMove,
+            stone: player,
+            moveIndex: row * boardSize + col,
+            wasAI: playerType(for: player) == .ai
+        ))
+        if gameOver {
+            updateLearningFromCompletedGame(winner: player)
+        }
         saveGameToDisk(manual: false)
         scheduleAIMoveIfNeeded()
     }
 
     private func scheduleAIMoveIfNeeded() {
         guard !gameOver, playerType(for: currentPlayer) == .ai else { return }
+        guard !aiPaused else {
+            isAIThinking = false
+            statusMessage = "\(currentPlayer.name) AI paused"
+            return
+        }
         aiComputationToken += 1
         let token = aiComputationToken
         let player = currentPlayer
@@ -297,6 +371,7 @@ final class PenteGameViewModel: ObservableObject {
         let historyCount = moveHistory.count
         let openingEnabled = tournamentOpening
         let strength = aiStrength
+        let learningStats = currentLearningStats()
 
         DispatchQueue.global(qos: .userInitiated).async {
             let move = Self.bestMove(
@@ -306,7 +381,8 @@ final class PenteGameViewModel: ObservableObject {
                 capturesWhite: capturesWhite,
                 historyCount: historyCount,
                 tournamentOpening: openingEnabled,
-                strength: strength
+                strength: strength,
+                learningStats: learningStats
             )
 
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
@@ -316,6 +392,7 @@ final class PenteGameViewModel: ObservableObject {
                     self.playMove(row: move.0, col: move.1)
                 } else {
                     self.gameOver = true
+                    self.updateLearningFromCompletedGame(winner: nil)
                     self.statusMessage = "Draw: no legal moves"
                 }
             }
@@ -394,6 +471,14 @@ final class PenteGameViewModel: ObservableObject {
     }
 
     private func saveURL() throws -> URL {
+        try appSupportURL().appendingPathComponent("saved-game.json")
+    }
+
+    private func learningFileURL() throws -> URL {
+        try appSupportURL().appendingPathComponent("strategy-learning.json")
+    }
+
+    private func appSupportURL() throws -> URL {
         let folder = try FileManager.default.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask,
@@ -401,7 +486,81 @@ final class PenteGameViewModel: ObservableObject {
             create: true
         ).appendingPathComponent("Pente", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        return folder.appendingPathComponent("saved-game.json")
+        return folder
+    }
+
+    private func currentLearningStats() -> [String: LearnedMoveStats] {
+        learningLock.lock()
+        defer { learningLock.unlock() }
+        return learningBook.moveStats
+    }
+
+    private func loadLearningBook() {
+        do {
+            let data = try Data(contentsOf: learningFileURL())
+            let book = try JSONDecoder().decode(StrategyLearningBook.self, from: data)
+            learningLock.lock()
+            learningBook = book
+            learningLock.unlock()
+        } catch {
+            learningLock.lock()
+            learningBook = StrategyLearningBook()
+            learningLock.unlock()
+        }
+    }
+
+    private func saveLearningBook() {
+        do {
+            learningLock.lock()
+            let book = learningBook
+            learningLock.unlock()
+            let data = try JSONEncoder().encode(book)
+            try data.write(to: learningFileURL(), options: .atomic)
+        } catch {
+            // Learning is advisory. Save failures should never interrupt play.
+        }
+    }
+
+    private func updateLearningFromCompletedGame(winner: Stone?) {
+        let aiMoves = learningTrace.filter(\.wasAI)
+        guard !aiMoves.isEmpty else {
+            learningTrace = []
+            return
+        }
+
+        learningLock.lock()
+        for entry in aiMoves {
+            let key = Self.learningKey(
+                boardSize: boardSize,
+                boardHashHex: entry.boardHashHex,
+                stone: entry.stone,
+                moveIndex: entry.moveIndex
+            )
+            var stats = learningBook.moveStats[key] ?? LearnedMoveStats(plays: 0, wins: 0)
+            stats.plays += 1
+            if let winner {
+                stats.wins += winner == entry.stone ? 1.0 : 0.0
+            } else {
+                stats.wins += 0.5
+            }
+            learningBook.moveStats[key] = stats
+        }
+        if learningBook.moveStats.count > learningMaxEntries {
+            learningBook.moveStats = Dictionary(
+                uniqueKeysWithValues: learningBook.moveStats
+                    .sorted { left, right in
+                        if left.value.plays == right.value.plays {
+                            return left.value.wins > right.value.wins
+                        }
+                        return left.value.plays > right.value.plays
+                    }
+                    .prefix(learningMaxEntries)
+                    .map { ($0.key, $0.value) }
+            )
+        }
+        learningLock.unlock()
+        learningTrace = []
+        saveLearningBook()
     }
 
     private func rebuildGame(through moveCount: Int) {
@@ -413,6 +572,7 @@ final class PenteGameViewModel: ObservableObject {
         capturesByBlack = 0
         capturesByWhite = 0
         moveHistory = []
+        learningTrace = []
         gameOver = false
         winner = nil
         lastMoveRow = nil
@@ -439,7 +599,8 @@ final class PenteGameViewModel: ObservableObject {
         capturesWhite: Int,
         historyCount: Int,
         tournamentOpening: Bool,
-        strength: AIStrength
+        strength: AIStrength,
+        learningStats: [String: LearnedMoveStats]
     ) -> (Int, Int)? {
         let size = board.count
         let center = size / 2
@@ -454,7 +615,8 @@ final class PenteGameViewModel: ObservableObject {
             tournamentOpening: tournamentOpening,
             capturesBlack: capturesBlack,
             capturesWhite: capturesWhite,
-            strength: strength
+            strength: strength,
+            learningStats: learningStats
         ) {
             return openingMove
         }
@@ -498,6 +660,12 @@ final class PenteGameViewModel: ObservableObject {
             limit: strength.candidateLimit
         )
         guard !legal.isEmpty else { return nil }
+        let boardHashHex = boardHashHex(
+            for: board,
+            capturesBlack: capturesBlack,
+            capturesWhite: capturesWhite,
+            currentPlayer: player
+        )
 
         let scoredMoves = legal.map { move in
             (
@@ -509,6 +677,12 @@ final class PenteGameViewModel: ObservableObject {
                     capturesBlack: capturesBlack,
                     capturesWhite: capturesWhite,
                     strength: strength
+                ) + learnedMoveAdjustment(
+                    learningStats: learningStats,
+                    boardSize: size,
+                    boardHashHex: boardHashHex,
+                    stone: player,
+                    moveIndex: move.0 * size + move.1
                 )
             )
         }.sorted { $0.score > $1.score }
@@ -528,7 +702,8 @@ final class PenteGameViewModel: ObservableObject {
         tournamentOpening: Bool,
         capturesBlack: Int,
         capturesWhite: Int,
-        strength: AIStrength
+        strength: AIStrength,
+        learningStats: [String: LearnedMoveStats]
     ) -> (Int, Int)? {
         guard !tournamentOpening else { return nil }
         let center = board.count / 2
@@ -552,6 +727,12 @@ final class PenteGameViewModel: ObservableObject {
             return (row, col)
         }
         guard !candidates.isEmpty else { return nil }
+        let boardHashHex = boardHashHex(
+            for: board,
+            capturesBlack: capturesBlack,
+            capturesWhite: capturesWhite,
+            currentPlayer: player
+        )
 
         let scored = candidates.map { move in
             let diagonalPressure = abs(move.0 - firstBlack.0) == abs(move.1 - firstBlack.1) ? 900 : 0
@@ -565,7 +746,13 @@ final class PenteGameViewModel: ObservableObject {
                     capturesBlack: capturesBlack,
                     capturesWhite: capturesWhite,
                     strength: strength
-                ) + diagonalPressure + centerBias
+                ) + diagonalPressure + centerBias + learnedMoveAdjustment(
+                    learningStats: learningStats,
+                    boardSize: board.count,
+                    boardHashHex: boardHashHex,
+                    stone: player,
+                    moveIndex: move.0 * board.count + move.1
+                )
             )
         }.sorted { $0.score > $1.score }
 
@@ -587,6 +774,77 @@ final class PenteGameViewModel: ObservableObject {
         case .normal: return 5_000
         case .strong: return 2_400
         }
+    }
+
+    private static func learningKey(
+        boardSize: Int,
+        boardHashHex: String,
+        stone: Stone,
+        moveIndex: Int
+    ) -> String {
+        "\(boardSize)|\(stone.rawValue)|\(boardHashHex)|\(moveIndex)"
+    }
+
+    private static func learnedMoveAdjustment(
+        learningStats: [String: LearnedMoveStats],
+        boardSize: Int,
+        boardHashHex: String,
+        stone: Stone,
+        moveIndex: Int
+    ) -> Int {
+        let key = learningKey(
+            boardSize: boardSize,
+            boardHashHex: boardHashHex,
+            stone: stone,
+            moveIndex: moveIndex
+        )
+        guard let stats = learningStats[key], stats.plays >= 2 else { return 0 }
+        let winRate = stats.wins / Double(stats.plays)
+        let confidence = min(1.0, log1p(Double(stats.plays)) / 5.0)
+        return Int((winRate - 0.5) * 40_000 * confidence)
+    }
+
+    private static func boardHashHex(
+        for board: [[Stone]],
+        capturesBlack: Int,
+        capturesWhite: Int,
+        currentPlayer: Stone
+    ) -> String {
+        String(boardHash(
+            for: board,
+            capturesBlack: capturesBlack,
+            capturesWhite: capturesWhite,
+            currentPlayer: currentPlayer
+        ), radix: 16)
+    }
+
+    private static func boardHash(
+        for board: [[Stone]],
+        capturesBlack: Int,
+        capturesWhite: Int,
+        currentPlayer: Stone
+    ) -> UInt64 {
+        var hash: UInt64 = 1_469_598_103_934_665_603
+        for row in board {
+            for stone in row {
+                mix(stone.hashCode, into: &hash)
+            }
+        }
+        mix(UInt64(capturesBlack), into: &hash)
+        mix(UInt64(capturesWhite), into: &hash)
+        mix(currentPlayer.hashCode, into: &hash)
+        return hash
+    }
+
+    private static func mix(_ value: UInt64, into hash: inout UInt64) {
+        hash ^= value & 0xff
+        hash &*= 1_099_511_628_211
+        hash ^= (value >> 8) & 0xff
+        hash &*= 1_099_511_628_211
+        hash ^= (value >> 16) & 0xff
+        hash &*= 1_099_511_628_211
+        hash ^= (value >> 24) & 0xff
+        hash &*= 1_099_511_628_211
     }
 
     private static func candidateMoves(

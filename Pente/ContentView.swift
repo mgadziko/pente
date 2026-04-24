@@ -27,6 +27,12 @@ struct ContentView: View {
                 .disabled(game.moveHistory.isEmpty || game.isAIThinking)
                 .fixedSize(horizontal: true, vertical: false)
 
+                Button(game.aiPaused ? "Resume AI" : "Pause AI") {
+                    game.toggleAIPause()
+                }
+                .disabled(game.gameOver)
+                .fixedSize(horizontal: true, vertical: false)
+
                 if game.isAIThinking {
                     HStack(spacing: 6) {
                         ProgressView()
