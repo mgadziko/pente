@@ -172,7 +172,7 @@ private struct PenteBoardView: View {
                                         Circle().stroke(.black.opacity(0.28), lineWidth: 1)
                                         if row == lastMoveRow, col == lastMoveCol {
                                             Circle()
-                                                .fill(board[row][col] == .black ? Color.white : Color.black)
+                                                .fill(Color.red)
                                                 .frame(width: step * 0.20, height: step * 0.20)
                                         }
                                     }

@@ -447,6 +447,18 @@ final class PenteGameViewModel: ObservableObject {
             return (center, center)
         }
 
+        if let openingMove = noTournamentOpeningMove(
+            for: player,
+            board: board,
+            historyCount: historyCount,
+            tournamentOpening: tournamentOpening,
+            capturesBlack: capturesBlack,
+            capturesWhite: capturesWhite,
+            strength: strength
+        ) {
+            return openingMove
+        }
+
         let emergencyLegal = allLegalMoves(
             board: board,
             player: player,
@@ -487,23 +499,94 @@ final class PenteGameViewModel: ObservableObject {
         )
         guard !legal.isEmpty else { return nil }
 
-        var best = legal[0]
-        var bestScore = Int.min
-        for move in legal {
-            let score = evaluate(
+        let scoredMoves = legal.map { move in
+            (
                 move: move,
-                player: player,
-                board: board,
-                capturesBlack: capturesBlack,
-                capturesWhite: capturesWhite,
-                strength: strength
+                score: evaluate(
+                    move: move,
+                    player: player,
+                    board: board,
+                    capturesBlack: capturesBlack,
+                    capturesWhite: capturesWhite,
+                    strength: strength
+                )
             )
-            if score > bestScore {
-                bestScore = score
-                best = move
+        }.sorted { $0.score > $1.score }
+
+        guard let best = scoredMoves.first else { return nil }
+        let tolerance = strategicVarietyTolerance(for: strength)
+        let nearBest = scoredMoves
+            .prefix(8)
+            .filter { best.score - $0.score <= tolerance }
+        return nearBest.randomElement()?.move ?? best.move
+    }
+
+    private static func noTournamentOpeningMove(
+        for player: Stone,
+        board: [[Stone]],
+        historyCount: Int,
+        tournamentOpening: Bool,
+        capturesBlack: Int,
+        capturesWhite: Int,
+        strength: AIStrength
+    ) -> (Int, Int)? {
+        guard !tournamentOpening else { return nil }
+        let center = board.count / 2
+        if historyCount == 0 {
+            return (center, center)
+        }
+
+        guard historyCount == 1, player == .white else { return nil }
+        guard let firstBlack = firstStone(in: board, stone: .black) else { return nil }
+
+        let offsets = [
+            (-1, -1), (-1, 1), (1, -1), (1, 1),
+            (-2, -1), (-2, 1), (2, -1), (2, 1),
+            (-1, -2), (1, -2), (-1, 2), (1, 2),
+            (-2, -2), (-2, 2), (2, -2), (2, 2)
+        ]
+        let candidates = offsets.compactMap { offset -> (Int, Int)? in
+            let row = firstBlack.0 + offset.0
+            let col = firstBlack.1 + offset.1
+            guard isOnBoard(row, col, size: board.count), board[row][col] == .empty else { return nil }
+            return (row, col)
+        }
+        guard !candidates.isEmpty else { return nil }
+
+        let scored = candidates.map { move in
+            let diagonalPressure = abs(move.0 - firstBlack.0) == abs(move.1 - firstBlack.1) ? 900 : 0
+            let centerBias = centerScore(row: move.0, col: move.1, size: board.count)
+            return (
+                move: move,
+                score: evaluate(
+                    move: move,
+                    player: player,
+                    board: board,
+                    capturesBlack: capturesBlack,
+                    capturesWhite: capturesWhite,
+                    strength: strength
+                ) + diagonalPressure + centerBias
+            )
+        }.sorted { $0.score > $1.score }
+
+        return scored.prefix(4).randomElement()?.move ?? scored[0].move
+    }
+
+    private static func firstStone(in board: [[Stone]], stone: Stone) -> (Int, Int)? {
+        for row in 0..<board.count {
+            for col in 0..<board.count where board[row][col] == stone {
+                return (row, col)
             }
         }
-        return best
+        return nil
+    }
+
+    private static func strategicVarietyTolerance(for strength: AIStrength) -> Int {
+        switch strength {
+        case .fast: return 9_000
+        case .normal: return 5_000
+        case .strong: return 2_400
+        }
     }
 
     private static func candidateMoves(
@@ -644,6 +727,7 @@ final class PenteGameViewModel: ObservableObject {
         score += centerScore(row: move.0, col: move.1, size: board.count)
         score += boardPatternScore(board: trial, player: player)
         score -= boardPatternScore(board: trial, player: opponent) * 2
+        score -= openStringPressureScore(board: trial, player: opponent) * 3
 
         if strength != .fast {
             score -= opponentThreatScore(
@@ -691,8 +775,10 @@ final class PenteGameViewModel: ObservableObject {
                 let capturePairs = (opponent == .black ? capturesBlack : capturesWhite) + captured / 2
                 let length = lineLength(row: row, col: col, player: opponent, board: trial)
                 if capturePairs >= 5 || length >= 5 { best = max(best, 500_000) }
-                if length == 4 { best = max(best, 80_000 + openEndCount(row: row, col: col, player: opponent, board: trial) * 12_000) }
-                if length == 3 { best = max(best, 16_000 + openEndCount(row: row, col: col, player: opponent, board: trial) * 4_000) }
+                let openEnds = openEndCount(row: row, col: col, player: opponent, board: trial)
+                if length == 4 { best = max(best, 110_000 + openEnds * 28_000) }
+                if length == 3 { best = max(best, 30_000 + openEnds * 14_000) }
+                if length == 2, openEnds == 2 { best = max(best, 14_000) }
             }
         }
         return best
@@ -779,9 +865,63 @@ final class PenteGameViewModel: ObservableObject {
                 case 3:
                     score += 3_800 + openEnds * 1_200
                 case 2:
-                    score += 700 + openEnds * 250
+                    score += 700 + openEnds * 450
                 default:
                     score += openEnds * 35
+                }
+            }
+        }
+        return score
+    }
+
+    private static func openStringPressureScore(board: [[Stone]], player: Stone) -> Int {
+        let directions = [(0, 1), (1, 0), (1, 1), (1, -1)]
+        var score = 0
+        for row in 0..<board.count {
+            for col in 0..<board.count where board[row][col] == player {
+                for (dr, dc) in directions {
+                    let previousRow = row - dr
+                    let previousCol = col - dc
+                    if isOnBoard(previousRow, previousCol, size: board.count),
+                       board[previousRow][previousCol] == player {
+                        continue
+                    }
+
+                    var length = 0
+                    var r = row
+                    var c = col
+                    while isOnBoard(r, c, size: board.count), board[r][c] == player {
+                        length += 1
+                        r += dr
+                        c += dc
+                    }
+
+                    guard length >= 2 else { continue }
+
+                    let frontOpen = isOnBoard(r, c, size: board.count) && board[r][c] == .empty
+                    let backRow = row - dr
+                    let backCol = col - dc
+                    let backOpen = isOnBoard(backRow, backCol, size: board.count) && board[backRow][backCol] == .empty
+                    let openEnds = (frontOpen ? 1 : 0) + (backOpen ? 1 : 0)
+
+                    guard openEnds > 0 else { continue }
+
+                    switch (length, openEnds) {
+                    case (4..., 2):
+                        score += 95_000
+                    case (4..., 1):
+                        score += 38_000
+                    case (3, 2):
+                        score += 36_000
+                    case (3, 1):
+                        score += 10_000
+                    case (2, 2):
+                        score += 16_000
+                    case (2, 1):
+                        score += 2_500
+                    default:
+                        break
+                    }
                 }
             }
         }
